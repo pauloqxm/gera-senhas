@@ -1,6 +1,5 @@
-streamlit==1.37.1
-sqlalchemy==2.0.32
-passlib[bcrypt]==1.7.4
-stripe==10.6.0
-psycopg2-binary==2.9.9
-pandas==2.2.2
+streamlit>=1. Thirty, <2
+sqlalchemy>=2.0
+passlib[bcrypt]>=1.7.4
+stripe>=10.0
+pandas>=2.2
