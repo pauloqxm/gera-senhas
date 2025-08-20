@@ -1,482 +1,229 @@
+import os
+from urllib.parse import urlparse
 import streamlit as st
-import pandas as pd
-import random
-import string
-import hashlib
-import json
-from datetime import datetime, timedelta
-import requests
-import base64
-import time
+from sqlalchemy.orm import Session
+from sqlalchemy import select
+from db import init_db, get_session, User, Payment
+from auth import create_user, authenticate, get_user_by_email
+from payments import create_checkout_session, verify_checkout_session
+from utils_passwords import generate_password
 
-# Configuração da página
-st.set_page_config(
-    page_title="Sistema de Pagamentos com Status",
-    page_icon="💳",
-    layout="wide"
-)
+st.set_page_config(page_title="Gerador de Senhas • SaaS", layout="wide")
 
-# Configurações (substitua com suas informações)
-GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN", "ghp_seu_token_aqui")
-GITHUB_REPO = st.secrets.get("GITHUB_REPO", "pauloqxm/gera-senhas")
-GITHUB_USER = st.secrets.get("GITHUB_USER", "pauloqxm")
+@st.cache_resource
+def _init_app():
+    init_db()
+    return True
 
-# Funções de utilidade
-def hash_senha(senha):
-    return hashlib.sha256(senha.encode()).hexdigest()
+_init_app()
 
-def gerar_senha(tamanho=12, usar_maiusculas=True, usar_numeros=True, usar_especiais=True):
-    caracteres = string.ascii_lowercase
-    if usar_maiusculas:
-        caracteres += string.ascii_uppercase
-    if usar_numeros:
-        caracteres += string.digits
-    if usar_especiais:
-        caracteres += string.punctuation
-    
-    return ''.join(random.choice(caracteres) for _ in range(tamanho))
+def _ensure_admin():
+    admin_email = st.secrets.get("admin", {}).get("email", "").strip().lower()
+    admin_pass = st.secrets.get("admin", {}).get("password", "")
+    admin_name = st.secrets.get("admin", {}).get("name", "Admin")
+    if not admin_email or not admin_pass:
+        return
+    with get_session() as db:
+        u = get_user_by_email(db, admin_email)
+        if not u:
+            create_user(db, admin_email, admin_name, admin_pass, is_admin=True, plan="premium")
+_ensure_admin()
 
-# Funções de integração com GitHub
-def github_get_file(filename):
-    """Busca um arquivo do repositório GitHub"""
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filename}"
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-    
-    try:
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            content = response.json()["content"]
-            return base64.b64decode(content).decode("utf-8")
-    except:
-        pass
-    return None
+if "user_id" not in st.session_state:
+    st.session_state.user_id = None
 
-def github_save_file(filename, content, message="Update file"):
-    """Salva um arquivo no repositório GitHub"""
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filename}"
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github.v3+json"
-    }
-    
-    # Verifica se o arquivo já existe para obter o SHA
-    sha = None
-    try:
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            sha = response.json()["sha"]
-    except:
-        pass
-    
-    data = {
-        "message": message,
-        "content": base64.b64encode(content.encode("utf-8")).decode("utf-8"),
-        "sha": sha
-    }
-    
-    try:
-        response = requests.put(url, headers=headers, json=data)
-        return response.status_code == 200 or response.status_code == 201
-    except:
-        return False
+def current_user() -> User | None:
+    if not st.session_state.user_id:
+        return None
+    with get_session() as db:
+        return db.query(User).filter(User.id == st.session_state.user_id).first()
 
-def carregar_usuarios():
-    """Carrega usuários do GitHub"""
-    usuarios_data = github_get_file("usuarios.json")
-    if usuarios_data:
-        return json.loads(usuarios_data)
-    return {}
+st.markdown("""
+<style>
+[data-testid="stSidebar"] {display: none;}
+.block-container {padding-top: 1rem; padding-bottom: 2rem; max-width: 1200px;}
+</style>
+""", unsafe_allow_html=True)
 
-def salvar_usuarios(usuarios):
-    """Salva usuários no GitHub"""
-    return github_save_file("usuarios.json", json.dumps(usuarios, indent=2), "Atualização de usuários")
+st.title("🔐 Gerador de Senhas (SaaS)")
 
-def carregar_pagamentos():
-    """Carrega pagamentos do GitHub"""
-    pagamentos_data = github_get_file("pagamentos.json")
-    if pagamentos_data:
-        return json.loads(pagamentos_data)
-    return []
+params = st.query_params
+if params.get("paid_success") == "true" and params.get("session_id"):
+    user = current_user()
+    if user:
+        with get_session() as db:
+            ok = verify_checkout_session(db, params.get("session_id"))
+            if ok:
+                u = db.query(User).filter(User.id == user.id).first()
+                if u and u.plan != "premium":
+                    u.plan = "premium"
+                    db.commit()
+                st.success("Pagamento confirmado! Seu plano agora é **premium**.")
+            else:
+                st.info("Não foi possível confirmar o pagamento. Se já pagou, tente novamente em alguns segundos.")
+elif params.get("paid_cancel") == "true":
+    st.warning("Pagamento cancelado.")
 
-def salvar_pagamentos(pagamentos):
-    """Salva pagamentos no GitHub"""
-    return github_save_file("pagamentos.json", json.dumps(pagamentos, indent=2), "Atualização de pagamentos")
-
-# Funções de processamento de pagamento
-def simular_processamento_pagamento(metodo, valor):
-    """Simula o processamento de um pagamento com diferentes resultados"""
-    # Simula atraso no processamento
-    time.sleep(2)
-    
-    # Probabilidades baseadas no método de pagamento
-    if metodo == "Cartão de Crédito":
-        # 80% de aprovação para cartão
-        aprovado = random.random() < 0.8
-    elif metodo == "PIX":
-        # 95% de aprovação para PIX
-        aprovado = random.random() < 0.95
-    else:  # Boleto
-        # 70% de aprovação para boleto
-        aprovado = random.random() < 0.7
-    
-    if aprovado:
-        return "Aprovado"
-    else:
-        # Razões para reprovação
-        razoes = ["Saldo insuficiente", "Problema técnico", "Transação suspeita", "Dados inválidos"]
-        return f"Reprovado - {random.choice(razoes)}"
-
-def atualizar_status_pagamentos():
-    """Atualiza automaticamente o status dos pagamentos pendentes"""
-    pagamentos = carregar_pagamentos()
-    atualizados = False
-    
-    for pagamento in pagamentos:
-        if pagamento["status"] == "Pendente":
-            # Simula a passagem do tempo
-            data_criacao = datetime.fromisoformat(pagamento["data_criacao"])
-            tempo_decorrido = datetime.now() - data_criacao
-            
-            # Se passou mais de 1 minuto, processa o pagamento
-            if tempo_decorrido.total_seconds() > 60:
-                pagamento["status"] = simular_processamento_pagamento(
-                    pagamento["metodo"], pagamento["valor"]
-                )
-                pagamento["data_processamento"] = datetime.now().isoformat()
-                atualizados = True
-    
-    if atualizados:
-        salvar_pagamentos(pagamentos)
-    
-    return atualizados
-
-# Interface Streamlit
-def main():
-    st.title("💳 Sistema de Pagamentos com Identificação de Status")
-    
-    if 'usuario_logado' not in st.session_state:
-        st.session_state.usuario_logado = None
-    
-    # Atualizar status de pagamentos pendentes
-    if atualizar_status_pagamentos():
-        st.rerun()
-    
-    # Menu principal
-    menu = ["Login", "Cadastro", "Gerar Senha", "Pagamentos", "Meus Pagamentos", "Sair", "Admin"]
-    escolha = st.sidebar.selectbox("Menu", menu)
-    
-    # Inicializar dados
-    usuarios = carregar_usuarios()
-    pagamentos = carregar_pagamentos()
-    
-    if escolha == "Cadastro" and not st.session_state.usuario_logado:
-        st.header("📝 Cadastro de Usuário")
-        
-        with st.form("form_cadastro"):
-            nome = st.text_input("Nome Completo")
-            email = st.text_input("Email")
-            senha = st.text_input("Senha", type="password")
-            confirmar_senha = st.text_input("Confirmar Senha", type="password")
-            
-            submitted = st.form_submit_button("Cadastrar")
-            
-            if submitted:
-                if senha != confirmar_senha:
-                    st.error("As senhas não coincidem!")
-                elif len(senha) < 6:
-                    st.error("A senha deve ter pelo menos 6 caracteres!")
-                elif email in usuarios:
-                    st.error("Email já cadastrado!")
-                else:
-                    usuarios[email] = {
-                        "nome": nome,
-                        "senha_hash": hash_senha(senha),
-                        "data_cadastro": datetime.now().isoformat()
-                    }
-                    if salvar_usuarios(usuarios):
-                        st.success("Cadastro realizado com sucesso!")
-                    else:
-                        st.error("Erro ao salvar no GitHub!")
-    
-    elif escolha == "Login" and not st.session_state.usuario_logado:
-        st.header("🔑 Login")
-        
-        with st.form("form_login"):
-            email = st.text_input("Email")
-            senha = st.text_input("Senha", type="password")
-            
+if not current_user():
+    tab_login, tab_register = st.tabs(["Entrar", "Cadastrar"])
+    with tab_login:
+        st.subheader("Acesse sua conta")
+        with st.form("form_login", clear_on_submit=False):
+            email = st.text_input("E-mail")
+            password = st.text_input("Senha", type="password")
             submitted = st.form_submit_button("Entrar")
-            
-            if submitted:
-                if email in usuarios and usuarios[email]["senha_hash"] == hash_senha(senha):
-                    st.session_state.usuario_logado = {
-                        "email": email,
-                        "nome": usuarios[email]["nome"]
-                    }
-                    st.success(f"Bem-vindo, {usuarios[email]['nome']}!")
+        if submitted:
+            with get_session() as db:
+                u = authenticate(db, email, password)
+                if u:
+                    st.session_state.user_id = u.id
                     st.rerun()
                 else:
-                    st.error("Credenciais inválidas!")
-    
-    elif escolha == "Gerar Senha":
-        st.header("🔑 Gerador de Senhas")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            tamanho = st.slider("Tamanho da senha", 8, 32, 12)
-            usar_maiusculas = st.checkbox("Incluir letras maiúsculas", value=True)
-            usar_numeros = st.checkbox("Incluir números", value=True)
-            usar_especiais = st.checkbox("Incluir caracteres especiais", value=True)
-            
-            if st.button("Gerar Senha"):
-                senha_gerada = gerar_senha(tamanho, usar_maiusculas, usar_numeros, usar_especiais)
-                st.session_state.senha_gerada = senha_gerada
-        
-        with col2:
-            if 'senha_gerada' in st.session_state:
-                st.success("Senha gerada com sucesso!")
-                st.code(st.session_state.senha_gerada)
-                st.info("⚠️ Guarde esta senha em local seguro!")
-                
-                # Teste de força da senha
-                forca = 0
-                if any(c.isupper() for c in st.session_state.senha_gerada):
-                    forca += 1
-                if any(c.isdigit() for c in st.session_state.senha_gerada):
-                    forca += 1
-                if any(c in string.punctuation for c in st.session_state.senha_gerada):
-                    forca += 1
-                if len(st.session_state.senha_gerada) >= 12:
-                    forca += 1
-                
-                if forca == 4:
-                    st.success("Força da senha: Excelente 🔒🔒🔒")
-                elif forca == 3:
-                    st.warning("Força da senha: Boa 🔒🔒")
+                    st.error("E-mail ou senha inválidos.")
+
+    with tab_register:
+        st.subheader("Crie sua conta")
+        with st.form("form_register"):
+            name = st.text_input("Nome completo")
+            email = st.text_input("E-mail")
+            password = st.text_input("Senha", type="password")
+            cpass = st.text_input("Confirmar Senha", type="password")
+            submitted = st.form_submit_button("Cadastrar")
+        if submitted:
+            if not name or not email or not password:
+                st.error("Preencha todos os campos.")
+            elif password != cpass:
+                st.error("As senhas não conferem.")
+            else:
+                with get_session() as db:
+                    if get_user_by_email(db, email):
+                        st.error("Já existe uma conta com este e-mail.")
+                    else:
+                        u = create_user(db, email, name, password, is_admin=False, plan="free")
+                        st.success("Conta criada! Faça login para continuar.")
+else:
+    user = current_user()
+    colL, colR = st.columns([3,1])
+    with colL:
+        st.markdown(f"Olá, **{user.name}** — Plano: **{user.plan}**")
+    with colR:
+        if st.button("Sair"):
+            st.session_state.user_id = None
+            st.rerun()
+
+    tabs = ["Gerador de Senhas", "Pagamentos"]
+    if user.is_admin:
+        tabs.append("Admin")
+    tab_objs = st.tabs(tabs)
+
+    with tab_objs[0]:
+        st.subheader("Gerador de Senhas")
+
+        max_len = 64 if user.plan == "premium" else 12
+        max_bulk = 200 if user.plan == "premium" else 1
+
+        with st.form("form_gen"):
+            length = st.slider("Tamanho", min_value=6, max_value=max_len, value=min(12, max_len))
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                use_upper = st.checkbox("A-Z", value=True)
+            with c2:
+                use_lower = st.checkbox("a-z", value=True)
+            with c3:
+                use_digits = st.checkbox("0-9", value=True)
+            with c4:
+                use_symbols = st.checkbox("Símbolos", value=False)
+            avoid_amb = st.checkbox("Evitar caracteres ambíguos (I, l, 0, O, | ...)", value=True)
+            qty = st.number_input("Quantidade", min_value=1, max_value=max_bulk, value=1, help="Premium permite lote.")
+            submitted = st.form_submit_button("Gerar")
+
+        if submitted:
+            if not any([use_upper, use_lower, use_digits, use_symbols]):
+                st.error("Selecione pelo menos um tipo de caractere.")
+            else:
+                passwords = [generate_password(length, use_upper, use_lower, use_digits, use_symbols, avoid_amb) for _ in range(qty)]
+                if qty == 1:
+                    pw = passwords[0]
+                    st.code(pw, language="text")
+                    st.download_button("Baixar .txt", data=pw, file_name="senha.txt")
                 else:
-                    st.error("Força da senha: Fraca 🔒")
-    
-    elif escolha == "Pagamentos" and st.session_state.usuario_logado:
-        st.header("💳 Sistema de Pagamentos")
-        
-        with st.form("form_pagamento"):
-            valor = st.number_input("Valor (R$)", min_value=0.0, step=0.01)
-            descricao = st.text_input("Descrição do pagamento")
-            
-            # Simulação de métodos de pagamento
-            metodo_pagamento = st.selectbox("Método de Pagamento", 
-                                           ["Cartão de Crédito", "PIX", "Boleto Bancário"])
-            
-            submitted = st.form_submit_button("Realizar Pagamento")
-            
-            if submitted:
-                novo_pagamento = {
-                    "id": len(pagamentos) + 1,
-                    "usuario_email": st.session_state.usuario_logado["email"],
-                    "usuario_nome": st.session_state.usuario_logado["nome"],
-                    "valor": valor,
-                    "descricao": descricao,
-                    "metodo": metodo_pagamento,
-                    "status": "Pendente",
-                    "data_criacao": datetime.now().isoformat(),
-                    "data_processamento": None
-                }
-                pagamentos.append(novo_pagamento)
-                if salvar_pagamentos(pagamentos):
-                    st.success(f"Pagamento de R$ {valor:.2f} registrado com sucesso! Aguardando processamento.")
-                    
-                    # Mostrar informações sobre o processamento
-                    with st.expander("ℹ️ Informações sobre o processamento"):
-                        st.write("""
-                        **Status do pagamento:**
-                        - ✅ **Pendente**: Seu pagamento foi registrado e está aguardando processamento.
-                        - ⏳ **Processando**: Seu pagamento está sendo processado (leva cerca de 1 minuto).
-                        - ✅ **Aprovado**: Seu pagamento foi aprovado com sucesso.
-                        - ❌ **Reprovado**: Seu pagamento foi reprovado. Verifique os detalhes para mais informações.
-                        
-                        Atualize a página ou verifique em 'Meus Pagamentos' para acompanhar o status.
-                        """)
-                    
-                    st.balloons()
-                else:
-                    st.error("Erro ao salvar no GitHub!")
-    
-    elif escolha == "Meus Pagamentos" and st.session_state.usuario_logado:
-        st.header("📋 Meus Pagamentos")
-        
-        meus_pagamentos = [p for p in pagamentos if p["usuario_email"] == st.session_state.usuario_logado["email"]]
-        
-        if meus_pagamentos:
-            # Ordenar por data (mais recente primeiro)
-            meus_pagamentos.sort(key=lambda x: x["data_criacao"], reverse=True)
-            
-            # Criar DataFrame para exibição
-            df = pd.DataFrame(meus_pagamentos)
-            df["data_criacao"] = pd.to_datetime(df["data_criacao"])
-            
-            # Formatar colunas para exibição
-            df_display = df[["id", "valor", "descricao", "metodo", "status", "data_criacao"]].copy()
-            df_display["data_criacao"] = df_display["data_criacao"].dt.strftime("%d/%m/%Y %H:%M")
-            df_display = df_display.rename(columns={
-                "id": "ID",
-                "valor": "Valor (R$)",
-                "descricao": "Descrição",
-                "metodo": "Método",
-                "status": "Status",
-                "data_criacao": "Data"
-            })
-            
-            # Colorir status
-            def color_status(val):
-                if "Aprovado" in val:
-                    return "color: green; font-weight: bold;"
-                elif "Reprovado" in val:
-                    return "color: red; font-weight: bold;"
-                elif "Pendente" in val:
-                    return "color: orange; font-weight: bold;"
-                else:
-                    return ""
-            
-            st.dataframe(df_display.style.applymap(color_status, subset=["Status"]), use_container_width=True)
-            
-            # Estatísticas
-            total_pago = df[df["status"].str.contains("Aprovado")]["valor"].sum() if any(df["status"].str.contains("Aprovado")) else 0
-            pendentes = len(df[df["status"] == "Pendente"])
-            aprovados = len(df[df["status"].str.contains("Aprovado")])
-            reprovados = len(df[df["status"].str.contains("Reprovado")])
-            
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Total Pago", f"R$ {total_pago:.2f}")
-            with col2:
-                st.metric("Pagamentos Pendentes", pendentes)
-            with col3:
-                st.metric("Pagamentos Aprovados", aprovados)
-            with col4:
-                st.metric("Pagamentos Reprovados", reprovados)
-                
-            # Gráfico de status
-            status_counts = df["status"].value_counts()
-            if not status_counts.empty:
-                st.subheader("📊 Distribuição de Status")
-                st.bar_chart(status_counts)
+                    csv = "password\n" + "\n".join(passwords)
+                    st.download_button("Baixar .csv", data=csv, file_name="senhas.csv")
+                    st.success(f"Geradas {qty} senhas.")
+
+        st.info("No plano **premium**, você pode gerar senhas mais longas e em lote.")
+
+    with tab_objs[1]:
+        st.subheader("Assine o Premium")
+        st.write("Desbloqueie senhas maiores, geração em lote e futuras funcionalidades.")
+
+        if user.plan == "premium":
+            st.success("Você já é **premium**. Obrigado!")
         else:
-            st.info("Nenhum pagamento registrado ainda.")
-    
-    elif escolha == "Admin" and st.session_state.usuario_logado and st.session_state.usuario_logado["email"] == "admin@admin.com":
-        st.header("👨‍💼 Painel Administrativo")
-        
-        tab1, tab2, tab3 = st.tabs(["Usuários", "Pagamentos", "Processar Pagamentos"])
-        
-        with tab1:
-            st.subheader("Usuários Cadastrados")
-            if usuarios:
-                df_usuarios = pd.DataFrame.from_dict(usuarios, orient='index')
-                df_usuarios = df_usuarios.reset_index().rename(columns={'index': 'email'})
-                st.dataframe(df_usuarios[['email', 'nome', 'data_cadastro']], use_container_width=True)
-                st.metric("Total de Usuários", len(usuarios))
-            else:
-                st.info("Nenhum usuário cadastrado.")
-        
-        with tab2:
-            st.subheader("Todos os Pagamentos")
-            if pagamentos:
-                df_pagamentos = pd.DataFrame(pagamentos)
-                df_pagamentos["data_criacao"] = pd.to_datetime(df_pagamentos["data_criacao"])
-                df_display = df_pagamentos[["id", "usuario_nome", "valor", "descricao", "metodo", "status", "data_criacao"]].copy()
-                df_display["data_criacao"] = df_display["data_criacao"].dt.strftime("%d/%m/%Y %H:%M")
-                
-                st.dataframe(df_display.style.applymap(color_status, subset=["Status"]), use_container_width=True)
-                
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Total de Pagamentos", len(pagamentos))
-                with col2:
-                    st.metric("Valor Total", f"R$ {df_pagamentos['valor'].sum():.2f}")
-                with col3:
-                    st.metric("Pagamentos Pendentes", len(df_pagamentos[df_pagamentos['status'] == 'Pendente']))
-                    
-                # Filtros
-                st.subheader("Filtros")
-                col1, col2 = st.columns(2)
-                with col1:
-                    status_filter = st.multiselect("Filtrar por status", options=df_pagamentos["status"].unique(), default=df_pagamentos["status"].unique())
-                with col2:
-                    metodo_filter = st.multiselect("Filtrar por método", options=df_pagamentos["metodo"].unique(), default=df_pagamentos["metodo"].unique())
-                
-                filtered_df = df_pagamentos[
-                    (df_pagamentos["status"].isin(status_filter)) & 
-                    (df_pagamentos["metodo"].isin(metodo_filter))
-                ]
-                
-                if not filtered_df.empty:
-                    st.metric("Pagamentos Filtrados", len(filtered_df))
-                    st.metric("Valor Filtrado", f"R$ {filtered_df['valor'].sum():.2f}")
-            else:
-                st.info("Nenhum pagamento registrado.")
-                
-        with tab3:
-            st.subheader("Processamento de Pagamentos")
-            st.info("Os pagamentos são processados automaticamente a cada minuto. Você pode forçar o processamento manualmente abaixo.")
-            
-            pagamentos_pendentes = [p for p in pagamentos if p["status"] == "Pendente"]
-            
-            if pagamentos_pendentes:
-                st.write(f"**Pagamentos pendentes:** {len(pagamentos_pendentes)}")
-                
-                if st.button("🔄 Processar Pagamentos Pendentes", type="primary"):
-                    with st.spinner("Processando pagamentos..."):
-                        for pagamento in pagamentos_pendentes:
-                            pagamento["status"] = simular_processamento_pagamento(
-                                pagamento["metodo"], pagamento["valor"]
-                            )
-                            pagamento["data_processamento"] = datetime.now().isoformat()
-                        
-                        if salvar_pagamentos(pagamentos):
-                            st.success("Pagamentos processados com sucesso!")
+            if st.button("Ir para Checkout (Stripe)"):
+                with get_session() as db:
+                    try:
+                        url = create_checkout_session(db, user, quantity=1)
+                        st.link_button("Abrir Checkout", url)
+                        st.info("Após pagar, você será redirecionado de volta e seu plano será ativado automaticamente.")
+                    except Exception as e:
+                        st.error(f"Erro criando checkout: {e}")
+
+        st.caption("Se preferir um gateway brasileiro (ex.: Mercado Pago), a lógica é parecida: criar sessão, redirecionar e verificar no retorno.")
+
+    if user.is_admin:
+        with tab_objs[2]:
+            st.subheader("Painel Administrativo")
+            with get_session() as db:
+                users = db.query(User).all()
+                pays = db.query(Payment).order_by(Payment.created_at.desc()).all()
+
+            st.markdown("### Usuários")
+            import pandas as pd
+            df_users = pd.DataFrame([{
+                "id": u.id, "email": u.email, "nome": u.name, "admin": u.is_admin, "plano": u.plan, "criado_em": u.created_at
+            } for u in users])
+            st.dataframe(df_users, use_container_width=True, hide_index=True)
+
+            st.markdown("### Pagamentos")
+            df_pay = pd.DataFrame([{
+                "id": p.id, "user_id": p.user_id, "status": p.status, "provider": p.provider,
+                "checkout_session_id": p.checkout_session_id, "intent": p.payment_intent_id,
+                "criado_em": p.created_at, "atualizado_em": p.updated_at
+            } for p in pays])
+            st.dataframe(df_pay, use_container_width=True, hide_index=True)
+
+            st.markdown("---")
+            st.markdown("#### Ações")
+            with get_session() as db:
+                emails = [u.email for u in db.query(User).all()]
+            target = st.selectbox("Selecionar usuário por e-mail", options=emails if emails else ["-"])
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                if st.button("Tornar Admin"):
+                    with get_session() as db:
+                        u = get_user_by_email(db, target)
+                        if u:
+                            u.is_admin = True
+                            db.commit()
+                            st.success(f"{u.email} agora é admin.")
                             st.rerun()
-                        else:
-                            st.error("Erro ao salvar no GitHub!")
-            else:
-                st.success("✅ Nenhum pagamento pendente para processar!")
-    
-    elif escolha == "Sair" and st.session_state.usuario_logado:
-        st.session_state.usuario_logado = None
-        st.success("Logout realizado com sucesso!")
-        st.rerun()
-    
-    # Status do usuário e informações do GitHub
-    if st.session_state.usuario_logado:
-        st.sidebar.success(f"👤 Logado como: {st.session_state.usuario_logado['nome']}")
-        st.sidebar.info(f"📅 Desde: {datetime.now().strftime('%d/%m/%Y')}")
-    else:
-        st.sidebar.warning("⚠️ Não logado")
-    
-    # Informações do GitHub na sidebar
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("🔗 Integração com GitHub")
-    st.sidebar.info(f"Repositório: {GITHUB_REPO}")
-    
-    if st.sidebar.button("🔄 Atualizar Dados do GitHub"):
-        usuarios = carregar_usuarios()
-        pagamentos = carregar_pagamentos()
-        st.sidebar.success("Dados atualizados do GitHub!")
-        st.rerun()
-        
-    # Informações sobre status de pagamento
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("📊 Status de Pagamento")
-    st.sidebar.info("""
-    - ✅ **Pendente**: Aguardando processamento
-    - ⏳ **Processando**: Em análise
-    - ✅ **Aprovado**: Pagamento confirmado
-    - ❌ **Reprovado**: Pagamento não aprovado
-    """)
-
-if __name__ == "__main__":
-
-    main()
+            with col2:
+                if st.button("Remover Admin"):
+                    with get_session() as db:
+                        u = get_user_by_email(db, target)
+                        if u:
+                            u.is_admin = False
+                            db.commit()
+                            st.success(f"{u.email} não é mais admin.")
+                            st.rerun()
+            with col3:
+                new_plan = st.selectbox("Plano", options=["free", "premium"], index=0, key="planselect")
+                if st.button("Alterar Plano"):
+                    with get_session() as db:
+                        u = get_user_by_email(db, target)
+                        if u:
+                            u.plan = new_plan
+                            db.commit()
+                            st.success(f"Plano de {u.email} atualizado para {new_plan}.")
+                            st.rerun()
