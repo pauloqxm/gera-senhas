@@ -18,8 +18,8 @@ st.set_page_config(
 
 # Configurações (substitua com suas informações)
 GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN", "ghp_seu_token_aqui")
-GITHUB_REPO = st.secrets.get("GITHUB_REPO", "seu_usuario/nome_repositorio")
-GITHUB_USER = st.secrets.get("GITHUB_USER", "seu_usuario")
+GITHUB_REPO = st.secrets.get("GITHUB_REPO", "pauloqxm/gera-senhas")
+GITHUB_USER = st.secrets.get("GITHUB_USER", "pauloqxm")
 
 # Funções de utilidade
 def hash_senha(senha):
@@ -478,4 +478,5 @@ def main():
     """)
 
 if __name__ == "__main__":
+
     main()
