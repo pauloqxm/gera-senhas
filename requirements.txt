@@ -1,5 +1,5 @@
-streamlit>=1. Thirty, <2
-sqlalchemy>=2.0
-passlib[bcrypt]>=1.7.4
-stripe>=10.0
-pandas>=2.2
+streamlit
+sqlalchemy
+passlib[bcrypt]
+stripe
+pandas
